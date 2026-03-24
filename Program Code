@@ -1,0 +1,173 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+import os
+import cv2
+
+# Dataset path
+dataset_path = "C:\\Users\\Lenovo\\Downloads\\projek 2\\dataset"
+
+# Custom dataset class untuk membaca gambar
+class CustomImageDataset(Dataset):
+    def __init__(self, folder_path, transform=None):
+        self.folder_path = folder_path
+        self.transform = transform
+        self.image_files = [f for f in os.listdir(folder_path) if f.endswith('.jpeg')]
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.folder_path, self.image_files[idx])
+        image = Image.open(img_path).convert('L')  # Konversi ke grayscale
+        if self.transform:
+            image = self.transform(image)
+        return image
+
+# Transformasi gambar
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),  # Resolusi tinggi 256x256
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+# Membuat dataset
+dataset = CustomImageDataset(dataset_path, transform=transform)
+
+# Membagi dataset menjadi training dan validation set
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+# DataLoader untuk training dan validation
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+
+# Fungsi untuk menambahkan Gaussian blur
+def add_blur(img, kernel_size=5):
+    img_blur = img.numpy().copy()  
+    img_blur = cv2.GaussianBlur(img_blur[0], (kernel_size, kernel_size), 0)
+    return torch.tensor(np.expand_dims(img_blur, axis=0), dtype=torch.float32)
+
+# Arsitektur UNet untuk rekonstruksi gambar
+class UNetAutoencoder(nn.Module):
+    def __init__(self):
+        super(UNetAutoencoder, self).__init__()
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2)
+        )
+
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+# Inisialisasi model, loss function, dan optimizer
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = UNetAutoencoder().to(device)
+criterion = nn.MSELoss()
+optimizer = optim.AdamW(model.parameters(), lr=0.0001)  # Menggunakan AdamW
+
+# Fungsi untuk melatih model
+def train_model(model, train_loader, val_loader, num_epochs):
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+
+        for data in train_loader:
+            img = data.to(device)
+            blur_img = torch.stack([add_blur(i) for i in img])  # Menambahkan blur
+
+            # Forward pass
+            output = model(blur_img)
+            loss = criterion(output, img)
+
+            # Backward pass dan optimasi
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for data in val_loader:
+                img = data.to(device)
+                output = model(img)
+                loss = criterion(output, img)
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+        val_losses.append(val_loss)
+
+        print(f'Epoch [{epoch + 1}/{num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+
+    return train_losses, val_losses
+
+# Melatih model
+num_epochs = 3000
+train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs)
+
+# Plot train dan validation loss
+plt.figure(figsize=(10, 5))
+plt.plot(train_losses, label='Train Loss')
+plt.plot(val_losses, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.title('Train and Validation Loss')
+plt.show()
+
+# Menampilkan hasil asli dan hasil rekonstruksi
+model.eval()
+with torch.no_grad():
+    num_samples = min(10, len(dataset))  # Ambil maksimal 10 gambar
+    sample_indices = np.random.choice(len(dataset), size=num_samples, replace=False)
+    sample_images = [dataset[i] for i in sample_indices]  # Ambil gambar contoh
+    blur_images = torch.stack([add_blur(img) for img in sample_images]).to(device)
+    reconstructed_images = model(blur_images)
+
+# Plot gambar asli dan hasil rekonstruksi
+n = num_samples
+plt.figure(figsize=(20, 4))
+
+for i in range(n):
+    # Gambar asli
+    ax = plt.subplot(2, n, i + 1)
+    plt.imshow(sample_images[i].squeeze().numpy(), cmap='gray')
+    plt.axis('off')
+    plt.title('Asli')
+
+    # Gambar hasil rekonstruksi
+    ax = plt.subplot(2, n, i + 1 + n)
+    plt.imshow(reconstructed_images[i].cpu().squeeze().numpy(), cmap='gray')
+    plt.axis('off')
+    plt.title('Rekonstruksi')
+
+plt.show()
